@@ -1,0 +1,121 @@
+package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/confluentinc/confluent-kafka-go/kafka"
+)
+
+func main() {
+	// 创建一个等待组，用于等待消费者线程的完成
+	var wg sync.WaitGroup
+
+	// 创建一个停止信号通道
+	stopChan := make(chan struct{})
+
+	// 创建一个接收终止信号的通道
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// 启动Kafka消费者线程
+	wg.Add(1)
+	go consumeFromKafka(stopChan, signalChan, &wg)
+
+	// 启动一个goroutine等待终止信号
+	go func() {
+		// 等待终止信号
+		<-signalChan
+
+		fmt.Println("Stopping Kafka consumer...")
+		// 发送停止信号给消费者线程
+		close(stopChan)
+	}()
+
+	// 主线程继续执行其他代码
+	// ...
+
+	// 等待消费者线程的完成
+	wg.Wait()
+}
+
+func consumeFromKafka(stopChan <-chan struct{}, signalChan <-chan os.Signal, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	// 创建Kafka消费者配置
+	config := &kafka.ConfigMap{
+		"bootstrap.servers": "localhost:9092",
+		"group.id":          "my-group",
+		"auto.offset.reset": "earliest",
+	}
+
+	// 创建Kafka消费者
+	consumer, err := kafka.NewConsumer(config)
+	if err != nil {
+		log.Fatal("Failed to create consumer:", err)
+	}
+
+	// 订阅指定的topic
+	topics := []string{"my-topic"}
+	err = consumer.SubscribeTopics(topics, nil)
+	if err != nil {
+		log.Fatal("Failed to subscribe to topics:", err)
+	}
+
+	// 消费消息
+ConsumerLoop:
+	for {
+		select {
+		case <-stopChan:
+			// 收到停止信号，停止消费
+			break ConsumerLoop
+		case <-signalChan:
+			// 收到终止信号，执行相应的清理操作并停止消费
+			fmt.Println("Stopping Kafka consumer...")
+			break ConsumerLoop
+		default:
+			ev := consumer.Poll(100)
+			if ev == nil {
+				continue
+			}
+
+			switch e := ev.(type) {
+			case *kafka.Message:
+				// 处理消息
+				fmt.Println("Received message:", string(e.Value))
+
+				// 发送消息到指定的接口
+				err := sendToAPI(string(e.Value))
+				if err != nil {
+					log.Println("Failed to send message to API:", err)
+				}
+			case kafka.Error:
+				log.Println("Error while consuming message:", e)
+			}
+		}
+	}
+
+	// 关闭消费者
+	consumer.Close()
+}
+
+// 发送消息到指定的接口
+func sendToAPI(message string) error {
+	// 执行发送逻辑，这里只是示例，你需要根据实际情况编写发送逻辑
+	resp, err := http.Post("http://api.example.com/endpoint", "application/json", strings.NewReader(message))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	// 检查响应状态码等...
+
+	return nil
+}
